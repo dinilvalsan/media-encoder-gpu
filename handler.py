@@ -34,7 +34,7 @@ except KeyError as e:
 
 # Configuration
 USE_GPU = os.environ.get('USE_GPU', 'true').lower() == 'true'
-TARGET_HEIGHT = int(os.environ.get('TARGET_HEIGHT', '360'))  # Changed to 360p
+TARGET_HEIGHT = int(os.environ.get('TARGET_HEIGHT', '480'))  # Changed to 480p
 THUMBNAIL_INTERVAL = int(os.environ.get('THUMBNAIL_INTERVAL', '10'))
 MAX_UPLOAD_WORKERS = int(os.environ.get('MAX_UPLOAD_WORKERS', '10'))
 HLS_SEGMENT_DURATION = int(os.environ.get('HLS_SEGMENT_DURATION', '6'))
@@ -103,7 +103,7 @@ def check_nvenc_available():
         return False
 
 
-def calculate_output_dimensions(width, height, target_height=360):
+def calculate_output_dimensions(width, height, target_height=480):
     """Calculate output dimensions maintaining aspect ratio"""
     if height <= target_height:
         return width, height
@@ -125,7 +125,7 @@ def get_video_info(video_path):
         result = run_command([
             'ffprobe',
             '-v', 'error',
-            '-show_entries', 'format=duration:stream=width,height,codec_name,r_frame_rate',
+            '-show_entries', 'format=duration:stream=width,height,codec_name,codec_type,r_frame_rate',  # Added codec_type
             '-of', 'json',
             video_path
         ], "Get Video Info", timeout=30)
@@ -133,7 +133,22 @@ def get_video_info(video_path):
         data = json.loads(result.stdout)
         duration = float(data.get('format', {}).get('duration', 0))
         
-        video_stream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'video'), {})
+        # Find video stream - now it will work because we have codec_type
+        video_stream = next(
+            (s for s in data.get('streams', []) if s.get('codec_type') == 'video'), 
+            None
+        )
+        
+        # Fallback: if codec_type filter fails, use first stream with width/height
+        if not video_stream:
+            video_stream = next(
+                (s for s in data.get('streams', []) if s.get('width') and s.get('height')),
+                {}
+            )
+        
+        if not video_stream:
+            print("⚠️ Warning: Could not find video stream, using defaults")
+            video_stream = {}
         
         # Parse frame rate
         fps_str = video_stream.get('r_frame_rate', '0/1')
@@ -143,21 +158,30 @@ def get_video_info(video_path):
         except:
             fps = 0
         
+        width = video_stream.get('width', 0)
+        height = video_stream.get('height', 0)
+        codec = video_stream.get('codec_name', 'unknown')
+        
+        print(f"  Detected: {width}x{height}, {codec}, {fps:.2f}fps, {duration:.2f}s")
+        
         return {
             'duration': duration,
-            'width': video_stream.get('width', 0),
-            'height': video_stream.get('height', 0),
-            'codec': video_stream.get('codec_name', 'unknown'),
+            'width': width,
+            'height': height,
+            'codec': codec,
             'fps': round(fps, 2)
         }
     except Exception as e:
-        print(f"Warning: Could not get video info: {e}")
+        print(f"❌ Error getting video info: {e}")
+        import traceback
+        traceback.print_exc()
         return {'duration': 0, 'width': 0, 'height': 0, 'codec': 'unknown', 'fps': 0}
 
 
-def transcode_to_hls(input_path, output_dir, use_gpu=True, target_height=360):
+def transcode_to_hls(input_path, output_dir, use_gpu=True, target_height=480):
     """
     Transcode to HLS with GPU acceleration (if available)
+    OPTIMIZED for speed with better quality at 480p
     """
     print(f"Starting HLS transcoding to {target_height}p (GPU: {use_gpu})...")
 
@@ -175,37 +199,44 @@ def transcode_to_hls(input_path, output_dir, use_gpu=True, target_height=360):
     print(f"  Input: {video_info['width']}x{video_info['height']}")
     print(f"  Output: {output_width}x{output_height}")
 
-    # Adjust bitrate based on resolution
+    # OPTIMIZED bitrate settings for 480p with better quality
     if target_height == 360:
         target_bitrate = '800k'
         max_bitrate = '1000k'
         buffer_size = '2000k'
+        cq_level = '25'
+        crf_level = '28'
     elif target_height == 480:
-        target_bitrate = '1200k'
-        max_bitrate = '1500k'
-        buffer_size = '3000k'
+        target_bitrate = '1400k'  # Increased from 1200k for better quality
+        max_bitrate = '1800k'     # Increased from 1500k
+        buffer_size = '3600k'     # Increased from 3000k
+        cq_level = '23'           # Lower = better quality (was 25)
+        crf_level = '25'          # Lower = better quality (was 28)
     else:  # 720p or higher
         target_bitrate = '2500k'
         max_bitrate = '3000k'
         buffer_size = '6000k'
+        cq_level = '23'
+        crf_level = '23'
 
     if use_gpu:
-        # NVENC GPU encoding
+        # OPTIMIZED NVENC GPU encoding - faster preset with good quality
         command = [
             'ffmpeg',
-            '-hwaccel', 'cuda',
+            '-hwaccel', 'cuda',  # Hardware decode
             '-hwaccel_output_format', 'cuda',
+            '-extra_hw_frames', '2',  # Optimize frame buffering
             '-i', input_path,
             '-vf', f'scale_cuda={output_width}:{output_height}',
             '-c:v', 'h264_nvenc',
-            '-preset', 'p4',
+            '-preset', 'p2',  # FASTER: p2 instead of p4 (p1=fastest, p7=slowest)
             '-tune', 'hq',
             '-rc', 'vbr',
-            '-cq', '25',
+            '-cq', cq_level,  # Quality level
             '-b:v', target_bitrate,
             '-maxrate', max_bitrate,
             '-bufsize', buffer_size,
-            '-g', '60',
+            '-g', '60',  # GOP size
             '-keyint_min', '60',
             '-spatial_aq', '1',
             '-temporal_aq', '1',
@@ -223,17 +254,17 @@ def transcode_to_hls(input_path, output_dir, use_gpu=True, target_height=360):
             playlist_path
         ]
     else:
-        # CPU encoding with ultrafast preset for speed
+        # OPTIMIZED CPU encoding - faster preset
         command = [
             'ffmpeg',
             '-i', input_path,
             '-vf', f'scale={output_width}:{output_height}',
             '-c:v', 'libx264',
-            '-preset', 'ultrafast',  # Fastest CPU preset
-            '-crf', '28',  # Higher CRF for faster encoding
+            '-preset', 'veryfast',  # CHANGED from ultrafast for better quality/speed balance
+            '-crf', crf_level,
             '-profile:v', 'main',
             '-level', '3.1',
-            '-maxrate', target_bitrate,
+            '-maxrate', max_bitrate,
             '-bufsize', buffer_size,
             '-g', '60',
             '-keyint_min', '60',
@@ -252,9 +283,9 @@ def transcode_to_hls(input_path, output_dir, use_gpu=True, target_height=360):
             playlist_path
         ]
 
-    # Increase timeout for longer videos
-    estimated_time = video_info.get('duration', 60) * (2 if use_gpu else 10)  # 2x for GPU, 10x for CPU
-    timeout = max(300, int(estimated_time))  # Minimum 5 minutes
+    # Adjusted timeout estimates
+    estimated_time = video_info.get('duration', 60) * (1.5 if use_gpu else 8)  # GPU is faster now
+    timeout = max(300, int(estimated_time))
     
     run_command(command, "HLS Transcode", timeout=timeout)
 
@@ -271,7 +302,7 @@ def transcode_to_hls(input_path, output_dir, use_gpu=True, target_height=360):
 
 def generate_thumbnails(input_path, output_dir, interval=10):
     """
-    Generate thumbnails every N seconds
+    OPTIMIZED: Generate thumbnails every N seconds with hardware acceleration if available
     """
     print(f"Generating thumbnails every {interval} seconds...")
 
@@ -281,16 +312,19 @@ def generate_thumbnails(input_path, output_dir, interval=10):
     video_info = get_video_info(input_path)
     estimated_count = int(video_info.get('duration', 0) / interval)
     
+    # OPTIMIZED: Use hardware decoding if available
     command = [
         'ffmpeg',
+        '-hwaccel', 'auto',  # Auto-detect hardware acceleration
         '-i', input_path,
         '-vf', f'fps=1/{interval},scale=320:-2',
-        '-q:v', '3',  # Slightly lower quality for faster processing
+        '-q:v', '4',  # Quality 2-5 is good (lower=better, but slower)
+        '-threads', '2',  # Limit threads for thumbnail generation
         '-y',
         output_pattern
     ]
 
-    timeout = max(60, estimated_count * 2)  # 2 seconds per thumbnail
+    timeout = max(60, estimated_count * 2)
     run_command(command, "Thumbnail Generation", timeout=timeout)
 
     thumbnails = sorted(glob(os.path.join(output_dir, 'thumb_*.jpg')))
