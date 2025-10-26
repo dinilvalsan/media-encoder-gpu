@@ -8,6 +8,7 @@ from glob import glob
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import math
 
 # --- R2 Configuration ---
 try:
@@ -33,31 +34,36 @@ except KeyError as e:
 
 # Configuration
 USE_GPU = os.environ.get('USE_GPU', 'true').lower() == 'true'
+TARGET_HEIGHT = int(os.environ.get('TARGET_HEIGHT', '360'))  # Changed to 360p
 THUMBNAIL_INTERVAL = int(os.environ.get('THUMBNAIL_INTERVAL', '10'))
 MAX_UPLOAD_WORKERS = int(os.environ.get('MAX_UPLOAD_WORKERS', '10'))
 HLS_SEGMENT_DURATION = int(os.environ.get('HLS_SEGMENT_DURATION', '6'))
 
 
-def run_command(command, description="Command"):
+def run_command(command, description="Command", timeout=None):
     """Execute shell command with error handling and real-time output"""
     try:
-        print(f"[{description}] Running: {' '.join(command)}")
+        print(f"[{description}] Running: {' '.join(command[:8])}...")  # Truncate for readability
         start_time = time.time()
         
         result = subprocess.run(
             command,
             check=True,
             capture_output=True,
-            text=True
+            text=True,
+            timeout=timeout
         )
         
         elapsed = time.time() - start_time
         print(f"[{description}] ✓ Success ({elapsed:.2f}s)")
         return result
+    except subprocess.TimeoutExpired:
+        print(f"[{description}] ❌ Timeout after {timeout}s!")
+        raise
     except subprocess.CalledProcessError as e:
         print(f"[{description}] ❌ Failed!")
-        print(f"STDOUT: {e.stdout}")
-        print(f"STDERR: {e.stderr}")
+        print(f"STDOUT: {e.stdout[-500:]}")  # Last 500 chars
+        print(f"STDERR: {e.stderr[-500:]}")
         raise
 
 
@@ -76,8 +82,41 @@ def check_gpu_available():
             return True
     except:
         pass
-    print("⚠️  No GPU detected, falling back to CPU")
+    print("⚠️  No GPU detected")
     return False
+
+
+def check_nvenc_available():
+    """Check if FFmpeg has NVENC encoder available"""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        has_nvenc = 'h264_nvenc' in result.stdout
+        print(f"✓ NVENC encoder: {'Available' if has_nvenc else 'Not available'}")
+        return has_nvenc
+    except:
+        print("⚠️  Could not check NVENC availability")
+        return False
+
+
+def calculate_output_dimensions(width, height, target_height=360):
+    """Calculate output dimensions maintaining aspect ratio"""
+    if height <= target_height:
+        return width, height
+    
+    # Calculate width maintaining aspect ratio (must be even)
+    aspect_ratio = width / height
+    new_width = math.ceil(target_height * aspect_ratio)
+    
+    # Ensure dimensions are even (required by most codecs)
+    new_width = new_width + (new_width % 2)
+    new_height = target_height + (target_height % 2)
+    
+    return new_width, new_height
 
 
 def get_video_info(video_path):
@@ -86,56 +125,90 @@ def get_video_info(video_path):
         result = run_command([
             'ffprobe',
             '-v', 'error',
-            '-show_entries', 'format=duration:stream=width,height,codec_name',
+            '-show_entries', 'format=duration:stream=width,height,codec_name,r_frame_rate',
             '-of', 'json',
             video_path
-        ], "Get Video Info")
+        ], "Get Video Info", timeout=30)
         
         data = json.loads(result.stdout)
         duration = float(data.get('format', {}).get('duration', 0))
         
         video_stream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'video'), {})
         
+        # Parse frame rate
+        fps_str = video_stream.get('r_frame_rate', '0/1')
+        try:
+            num, den = map(int, fps_str.split('/'))
+            fps = num / den if den != 0 else 0
+        except:
+            fps = 0
+        
         return {
             'duration': duration,
             'width': video_stream.get('width', 0),
             'height': video_stream.get('height', 0),
-            'codec': video_stream.get('codec_name', 'unknown')
+            'codec': video_stream.get('codec_name', 'unknown'),
+            'fps': round(fps, 2)
         }
     except Exception as e:
         print(f"Warning: Could not get video info: {e}")
-        return {'duration': 0, 'width': 0, 'height': 0, 'codec': 'unknown'}
+        return {'duration': 0, 'width': 0, 'height': 0, 'codec': 'unknown', 'fps': 0}
 
 
-def transcode_to_hls(input_path, output_dir, use_gpu=True):
+def transcode_to_hls(input_path, output_dir, use_gpu=True, target_height=360):
     """
-    Transcode to 480p HLS with GPU acceleration (if available)
+    Transcode to HLS with GPU acceleration (if available)
     """
-    print(f"Starting HLS transcoding (GPU: {use_gpu})...")
+    print(f"Starting HLS transcoding to {target_height}p (GPU: {use_gpu})...")
 
     playlist_path = os.path.join(output_dir, 'playlist.m3u8')
     segment_pattern = os.path.join(output_dir, 'segment_%03d.ts')
 
+    # Get input dimensions
+    video_info = get_video_info(input_path)
+    output_width, output_height = calculate_output_dimensions(
+        video_info['width'], 
+        video_info['height'], 
+        target_height
+    )
+    
+    print(f"  Input: {video_info['width']}x{video_info['height']}")
+    print(f"  Output: {output_width}x{output_height}")
+
+    # Adjust bitrate based on resolution
+    if target_height == 360:
+        target_bitrate = '800k'
+        max_bitrate = '1000k'
+        buffer_size = '2000k'
+    elif target_height == 480:
+        target_bitrate = '1200k'
+        max_bitrate = '1500k'
+        buffer_size = '3000k'
+    else:  # 720p or higher
+        target_bitrate = '2500k'
+        max_bitrate = '3000k'
+        buffer_size = '6000k'
+
     if use_gpu:
-        # NVENC GPU encoding - 5-10x faster
+        # NVENC GPU encoding
         command = [
             'ffmpeg',
             '-hwaccel', 'cuda',
             '-hwaccel_output_format', 'cuda',
             '-i', input_path,
-            '-vf', 'scale_cuda=-2:480',  # GPU-based scaling
+            '-vf', f'scale_cuda={output_width}:{output_height}',
             '-c:v', 'h264_nvenc',
-            '-preset', 'p4',  # p1 (fastest) to p7 (slowest), p4 is balanced
-            '-tune', 'hq',  # High quality tuning
-            '-rc', 'vbr',  # Variable bitrate
-            '-cq', '23',  # Quality level (lower = better)
-            '-b:v', '1200k',
-            '-maxrate', '1500k',
-            '-bufsize', '3000k',
-            '-g', '90',  # GOP size
-            '-keyint_min', '90',
-            '-spatial_aq', '1',  # Spatial adaptive quantization
-            '-temporal_aq', '1',  # Temporal adaptive quantization
+            '-preset', 'p4',
+            '-tune', 'hq',
+            '-rc', 'vbr',
+            '-cq', '25',
+            '-b:v', target_bitrate,
+            '-maxrate', max_bitrate,
+            '-bufsize', buffer_size,
+            '-g', '60',
+            '-keyint_min', '60',
+            '-spatial_aq', '1',
+            '-temporal_aq', '1',
             '-c:a', 'aac',
             '-b:a', '128k',
             '-ar', '48000',
@@ -150,20 +223,20 @@ def transcode_to_hls(input_path, output_dir, use_gpu=True):
             playlist_path
         ]
     else:
-        # CPU encoding with 'veryfast' preset
+        # CPU encoding with ultrafast preset for speed
         command = [
             'ffmpeg',
             '-i', input_path,
-            '-vf', 'scale=-2:480',
+            '-vf', f'scale={output_width}:{output_height}',
             '-c:v', 'libx264',
-            '-preset', 'veryfast',  # Much faster than 'medium'
-            '-crf', '25',  # Slightly higher CRF for speed
+            '-preset', 'ultrafast',  # Fastest CPU preset
+            '-crf', '28',  # Higher CRF for faster encoding
             '-profile:v', 'main',
             '-level', '3.1',
-            '-maxrate', '1200k',
-            '-bufsize', '2400k',
-            '-g', '90',
-            '-keyint_min', '90',
+            '-maxrate', target_bitrate,
+            '-bufsize', buffer_size,
+            '-g', '60',
+            '-keyint_min', '60',
             '-sc_threshold', '0',
             '-c:a', 'aac',
             '-b:a', '128k',
@@ -179,36 +252,46 @@ def transcode_to_hls(input_path, output_dir, use_gpu=True):
             playlist_path
         ]
 
-    run_command(command, "HLS Transcode")
+    # Increase timeout for longer videos
+    estimated_time = video_info.get('duration', 60) * (2 if use_gpu else 10)  # 2x for GPU, 10x for CPU
+    timeout = max(300, int(estimated_time))  # Minimum 5 minutes
+    
+    run_command(command, "HLS Transcode", timeout=timeout)
 
     segments = sorted(glob(os.path.join(output_dir, 'segment_*.ts')))
     print(f"✓ Generated {len(segments)} HLS segments")
 
     return {
         'playlist_path': playlist_path,
-        'segments': segments
+        'segments': segments,
+        'output_width': output_width,
+        'output_height': output_height
     }
 
 
 def generate_thumbnails(input_path, output_dir, interval=10):
     """
     Generate thumbnails every N seconds
-    Uses CPU as thumbnail generation is lightweight
     """
     print(f"Generating thumbnails every {interval} seconds...")
 
     output_pattern = os.path.join(output_dir, 'thumb_%04d.jpg')
 
+    # Get video duration to estimate thumbnail count
+    video_info = get_video_info(input_path)
+    estimated_count = int(video_info.get('duration', 0) / interval)
+    
     command = [
         'ffmpeg',
         '-i', input_path,
-        '-vf', f'fps=1/{interval},scale=320:-2',  # 320px wide, maintain aspect ratio
-        '-q:v', '2',  # Quality 2 (1-31, lower is better)
+        '-vf', f'fps=1/{interval},scale=320:-2',
+        '-q:v', '3',  # Slightly lower quality for faster processing
         '-y',
         output_pattern
     ]
 
-    run_command(command, "Thumbnail Generation")
+    timeout = max(60, estimated_count * 2)  # 2 seconds per thumbnail
+    run_command(command, "Thumbnail Generation", timeout=timeout)
 
     thumbnails = sorted(glob(os.path.join(output_dir, 'thumb_*.jpg')))
     print(f"✓ Generated {len(thumbnails)} thumbnails")
@@ -227,11 +310,11 @@ def upload_file_async(local_path, s3_key, content_type=None):
         
         # Add cache control for HLS content
         if s3_key.endswith('.m3u8'):
-            extra_args['CacheControl'] = 'max-age=3600'  # 1 hour
+            extra_args['CacheControl'] = 'max-age=3600'
         elif s3_key.endswith('.ts'):
-            extra_args['CacheControl'] = 'max-age=31536000'  # 1 year (immutable)
+            extra_args['CacheControl'] = 'max-age=31536000'
         elif s3_key.endswith('.jpg'):
-            extra_args['CacheControl'] = 'max-age=31536000'  # 1 year
+            extra_args['CacheControl'] = 'max-age=31536000'
         
         s3.upload_file(local_path, S3_BUCKET_NAME, s3_key, ExtraArgs=extra_args)
         
@@ -252,11 +335,11 @@ def upload_file_async(local_path, s3_key, content_type=None):
 def parallel_upload_files(files_to_upload, max_workers=10):
     """
     Upload multiple files in parallel
-    files_to_upload: list of (local_path, s3_key, content_type) tuples
     """
     print(f"Uploading {len(files_to_upload)} files with {max_workers} workers...")
     
     upload_results = []
+    completed = 0
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -267,13 +350,18 @@ def parallel_upload_files(files_to_upload, max_workers=10):
         for future in as_completed(futures):
             result = future.result()
             upload_results.append(result)
+            completed += 1
             
             if result['status'] == 'success':
-                print(f"  ✓ {os.path.basename(result['key'])} ({result['size']/1024:.1f} KB)")
+                print(f"  [{completed}/{len(files_to_upload)}] ✓ {os.path.basename(result['key'])} ({result['size']/1024:.1f} KB)")
+            else:
+                print(f"  [{completed}/{len(files_to_upload)}] ✗ {os.path.basename(result['key'])}")
     
     failed = [r for r in upload_results if r['status'] == 'error']
     if failed:
         print(f"⚠️  {len(failed)} uploads failed")
+        for f in failed[:5]:  # Show first 5 failures
+            print(f"    - {f['key']}: {f.get('error', 'Unknown error')}")
     
     return upload_results
 
@@ -288,8 +376,6 @@ def handler(job):
             "source_video_key": "uploads/video123.mp4"
         }
     }
-    
-    Returns processing results with HLS playlist, segments, and thumbnails
     """
 
     if not s3:
@@ -315,7 +401,7 @@ def handler(job):
     print(f"{'='*60}")
     print(f"Job ID: {job_id}")
     print(f"Source: {source_video_key}")
-    print(f"GPU Mode: {USE_GPU}")
+    print(f"Target Resolution: {TARGET_HEIGHT}p")
     print(f"{'='*60}\n")
 
     # Setup temp directories
@@ -330,9 +416,13 @@ def handler(job):
     local_input = os.path.join(input_dir, os.path.basename(source_video_key))
 
     try:
-        # Check GPU availability
+        # Check GPU and NVENC availability
         gpu_available = check_gpu_available() if USE_GPU else False
-        use_gpu = USE_GPU and gpu_available
+        nvenc_available = check_nvenc_available() if gpu_available else False
+        use_gpu = USE_GPU and gpu_available and nvenc_available
+        
+        if USE_GPU and not use_gpu:
+            print("⚠️  GPU requested but not available, falling back to CPU")
 
         # Step 1: Download source video
         print(f"📥 Downloading {source_video_key}...")
@@ -345,17 +435,24 @@ def handler(job):
         # Step 2: Get video info
         video_info = get_video_info(local_input)
         print(f"📹 Video: {video_info['width']}x{video_info['height']}, "
-              f"{video_info['duration']:.1f}s, {video_info['codec']}")
+              f"{video_info['duration']:.1f}s, {video_info['codec']}, {video_info['fps']} fps")
 
-        # Step 3: Parallel processing - HLS transcoding + Thumbnail generation
+        # Calculate output dimensions
+        output_width, output_height = calculate_output_dimensions(
+            video_info['width'], 
+            video_info['height'], 
+            TARGET_HEIGHT
+        )
+
+        # Step 3: Parallel processing
         print(f"\n⚙️  Starting parallel processing...")
         process_start = time.time()
         
         with ThreadPoolExecutor(max_workers=2) as executor:
-            hls_future = executor.submit(transcode_to_hls, local_input, hls_dir, use_gpu)
+            hls_future = executor.submit(transcode_to_hls, local_input, hls_dir, use_gpu, TARGET_HEIGHT)
             thumb_future = executor.submit(generate_thumbnails, local_input, thumb_dir, THUMBNAIL_INTERVAL)
             
-            # Wait for both to complete
+            # Wait for both
             hls_result = hls_future.result()
             thumbnails = thumb_future.result()
         
@@ -369,7 +466,7 @@ def handler(job):
         s3_prefix = f"processed/{job_id}"
         files_to_upload = []
 
-        # Prepare playlist upload
+        # Playlist
         playlist_key = f"{s3_prefix}/hls/playlist.m3u8"
         files_to_upload.append((
             hls_result['playlist_path'],
@@ -377,7 +474,7 @@ def handler(job):
             'application/vnd.apple.mpegurl'
         ))
 
-        # Prepare segment uploads
+        # Segments
         segment_keys = []
         for seg in hls_result['segments']:
             seg_name = os.path.basename(seg)
@@ -385,7 +482,7 @@ def handler(job):
             segment_keys.append(seg_key)
             files_to_upload.append((seg, seg_key, 'video/mp2t'))
 
-        # Prepare thumbnail uploads
+        # Thumbnails
         thumb_keys = []
         for thumb in thumbnails:
             thumb_name = os.path.basename(thumb)
@@ -393,15 +490,15 @@ def handler(job):
             thumb_keys.append(thumb_key)
             files_to_upload.append((thumb, thumb_key, 'image/jpeg'))
 
-        # Upload all files in parallel
+        # Upload
         upload_results = parallel_upload_files(files_to_upload, max_workers=MAX_UPLOAD_WORKERS)
         upload_time = time.time() - upload_start
         
         successful_uploads = [r for r in upload_results if r['status'] == 'success']
         total_uploaded_mb = sum(r['size'] for r in successful_uploads) / (1024 * 1024)
-        print(f"✓ Uploaded {len(successful_uploads)} files ({total_uploaded_mb:.2f} MB) in {upload_time:.2f}s")
+        print(f"✓ Uploaded {len(successful_uploads)}/{len(files_to_upload)} files ({total_uploaded_mb:.2f} MB) in {upload_time:.2f}s")
 
-        # Calculate total time
+        # Total time
         end_time = datetime.utcnow()
         total_time = (end_time - start_time).total_seconds()
 
@@ -412,9 +509,10 @@ def handler(job):
         print(f"  Download: {download_time:.2f}s")
         print(f"  Processing: {process_time:.2f}s")
         print(f"  Upload: {upload_time:.2f}s")
+        print(f"Speed: {file_size_mb / total_time:.2f} MB/s")
         print(f"{'='*60}\n")
 
-        # Return structured response
+        # Return response
         return {
             "status": "success",
             "job_id": job_id,
@@ -422,14 +520,22 @@ def handler(job):
                 "total_seconds": round(total_time, 2),
                 "download_seconds": round(download_time, 2),
                 "processing_seconds": round(process_time, 2),
-                "upload_seconds": round(upload_time, 2)
+                "upload_seconds": round(upload_time, 2),
+                "processing_speed_mbps": round(file_size_mb / total_time, 2)
             },
             "source": {
                 "key": source_video_key,
                 "size_mb": round(file_size_mb, 2),
                 "duration_seconds": round(video_info['duration'], 2),
-                "resolution": f"{video_info['width']}x{video_info['height']}",
+                "width": video_info['width'],
+                "height": video_info['height'],
+                "fps": video_info['fps'],
                 "codec": video_info['codec']
+            },
+            "output": {
+                "width": output_width,
+                "height": output_height,
+                "target_height": TARGET_HEIGHT
             },
             "hls": {
                 "playlist_key": playlist_key,
@@ -446,7 +552,8 @@ def handler(job):
             },
             "processing": {
                 "gpu_used": use_gpu,
-                "gpu_available": gpu_available
+                "gpu_available": gpu_available,
+                "nvenc_available": nvenc_available
             },
             "storage_prefix": s3_prefix
         }
@@ -467,11 +574,12 @@ def handler(job):
             "job_id": job_id,
             "error": str(e),
             "error_type": type(e).__name__,
-            "processing_time_seconds": round(error_time, 2)
+            "processing_time_seconds": round(error_time, 2),
+            "traceback": traceback.format_exc()
         }
 
     finally:
-        # Cleanup temp files
+        # Cleanup
         print("🧹 Cleaning up temporary files...")
         try:
             import shutil
@@ -482,12 +590,12 @@ def handler(job):
             print(f"⚠️  Cleanup warning: {e}")
 
 
-# Start RunPod worker
 if __name__ == "__main__":
     print("\n" + "="*60)
     print("🚀 RunPod Video Processing Worker Starting")
     print("="*60)
     print(f"GPU Mode: {USE_GPU}")
+    print(f"Target Height: {TARGET_HEIGHT}p")
     print(f"Thumbnail Interval: {THUMBNAIL_INTERVAL}s")
     print(f"HLS Segment Duration: {HLS_SEGMENT_DURATION}s")
     print(f"Max Upload Workers: {MAX_UPLOAD_WORKERS}")
